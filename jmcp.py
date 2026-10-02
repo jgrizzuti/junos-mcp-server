@@ -1155,6 +1155,41 @@ def _detect_config_format(rendered_config: str) -> str:
     return "set"
 
 
+# Junos accepts `commit confirmed 1..65535` (minutes).
+CONFIRM_TIMEOUT_MIN = 1
+CONFIRM_TIMEOUT_MAX = 65535
+
+
+def _parse_confirm_timeout(value) -> int | None:
+    """Validate an optional confirm_timeout_mins argument.
+
+    Returns None when the caller did not ask for a confirmed commit, otherwise
+    the timeout in minutes. Raises ValueError for anything Junos would reject,
+    so a typo never silently degrades into a plain (non-reverting) commit.
+    """
+    if value is None:
+        return None
+    # bool is an int subclass; True would otherwise become a 1-minute window.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"confirm_timeout_mins must be an integer, got {value!r}")
+    if not CONFIRM_TIMEOUT_MIN <= value <= CONFIRM_TIMEOUT_MAX:
+        raise ValueError(
+            f"confirm_timeout_mins must be between {CONFIRM_TIMEOUT_MIN} and "
+            f"{CONFIRM_TIMEOUT_MAX}, got {value}"
+        )
+    return value
+
+
+def _confirmed_commit_note(router_name: str, confirm_timeout: int | None) -> str:
+    """Reminder appended to a successful commit result when it must be confirmed."""
+    if confirm_timeout is None:
+        return ""
+    return (
+        f"\n\n⏳ Commit confirmed: {router_name} will automatically roll back in "
+        f"{confirm_timeout} minute(s) unless confirm_commit is called for it."
+    )
+
+
 def _dry_run_commit_check(
     rtr_name: str, cu: Config, diff: str, msgs: list[tuple[str, str]]
 ) -> str:
@@ -1205,6 +1240,7 @@ def _apply_rendered_config_sync(
     dry_run: bool,
     commit_comment: str,
     timeout: int,
+    confirm_timeout: int | None = None,
 ) -> tuple[str, list[tuple[str, str]]]:
     """Blocking per-router device work, run via anyio.to_thread.run_sync.
 
@@ -1251,13 +1287,21 @@ def _apply_rendered_config_sync(
                     return f"❌ {rtr_name}: {result_msg}", msgs
 
                 msgs.append(("info", f"Committing configuration on {rtr_name}..."))
-                cu.commit(comment=commit_comment, timeout=timeout)
+                if confirm_timeout is None:
+                    cu.commit(comment=commit_comment, timeout=timeout)
+                else:
+                    cu.commit(
+                        comment=commit_comment,
+                        confirm=confirm_timeout,
+                        timeout=timeout,
+                    )
                 msgs.append(
                     ("info", f"{rtr_name}: Configuration committed successfully")
                 )
                 return (
                     f"✅ {rtr_name}: Configuration committed successfully. "
-                    f"Changes:\n\n{diff}",
+                    f"Changes:\n\n{diff}"
+                    + _confirmed_commit_note(rtr_name, confirm_timeout),
                     msgs,
                 )
 
@@ -1328,6 +1372,11 @@ async def handle_render_and_apply_j2_template(
 
     def _error(message: str) -> list[types.ContentBlock]:
         return [types.TextContent(type="text", text=message)]
+
+    try:
+        confirm_timeout = _parse_confirm_timeout(arguments.get("confirm_timeout_mins"))
+    except ValueError as ve:
+        return _error(f"❌ Error: {ve}")
 
     if not template_content:
         return _error("❌ Error: template_content is required")
@@ -1449,6 +1498,7 @@ async def handle_render_and_apply_j2_template(
                 dry_run,
                 commit_comment,
                 timeout,
+                confirm_timeout,
             )
         except ValueError as ve:
             return f"❌ {rtr_name}: {ve}", [("error", f"{rtr_name}: {ve}")]
@@ -1495,6 +1545,7 @@ async def handle_render_and_apply_j2_template(
                 "router_names": targets,
                 "rendered_config": rendered_config,
                 "dry_run": dry_run,
+                "confirm_timeout_mins": confirm_timeout,
                 "variables": str(variables),
             },
         )
@@ -1658,9 +1709,18 @@ async def handle_load_and_commit_config(
     config_format = arguments.get("config_format", "set")
     commit_comment = arguments.get("commit_comment", "Configuration loaded via MCP")
     timeout = get_timeout_with_fallback(arguments.get("timeout"))
+    dry_run = bool(arguments.get("dry_run", False))
+    try:
+        confirm_timeout = _parse_confirm_timeout(arguments.get("confirm_timeout_mins"))
+        confirm_error = None
+    except ValueError as ve:
+        confirm_timeout = None
+        confirm_error = f"Error: {ve}"
 
     is_blocked, blocked_message = check_config_blocklist(config_text)
-    if is_blocked:
+    if confirm_error:
+        result = confirm_error
+    elif is_blocked:
         result = blocked_message
     elif router_name not in devices:
         result = f"Router {router_name} not found in the device mapping."
@@ -1695,11 +1755,42 @@ async def handle_load_and_commit_config(
                         config_util.unlock()
                         return "No configuration changes detected"
 
-                    config_util.commit(comment=commit_comment, timeout=timeout)
+                    # Validate before committing. PyEZ raises CommitError on a
+                    # failed check; a False return is handled the same way.
+                    try:
+                        check_ok = config_util.commit_check()
+                        check_error = "configuration has errors"
+                    except CommitError as ce:
+                        check_ok = False
+                        check_error = str(ce)
+                    if not check_ok or dry_run:
+                        config_util.rollback()
+                        config_util.unlock()
+                        if not check_ok:
+                            return (
+                                f"Failed commit check on {router_name}: "
+                                f"{check_error}. Nothing was committed and the "
+                                "candidate was rolled back."
+                            )
+                        return (
+                            f"Dry run: commit check passed on {router_name}. "
+                            "Nothing was committed and the candidate was rolled "
+                            f"back. Changes:\n{diff}"
+                        )
+
+                    if confirm_timeout is None:
+                        config_util.commit(comment=commit_comment, timeout=timeout)
+                    else:
+                        config_util.commit(
+                            comment=commit_comment,
+                            confirm=confirm_timeout,
+                            timeout=timeout,
+                        )
                     config_util.unlock()
                     return (
                         "Configuration successfully loaded and "
                         f"committed on {router_name}. Changes:\n{diff}"
+                        + _confirmed_commit_note(router_name, confirm_timeout)
                     )
                 except Exception as e:
                     try:
@@ -1738,10 +1829,85 @@ async def handle_load_and_commit_config(
             "config_text": config_text,
             "config_format": config_format,
             "commit_comment": commit_comment,
+            "dry_run": dry_run,
+            "confirm_timeout_mins": confirm_timeout,
         },
     )
 
     return [content_block]
+
+
+async def handle_confirm_commit(
+    arguments: dict, context: Context
+) -> list[types.ContentBlock]:
+    """Handler for confirm_commit tool.
+
+    Confirms a pending `commit confirmed` by issuing a plain commit, which
+    stops the automatic rollback. Refuses when the candidate holds
+    uncommitted changes, so confirming can never commit someone else's edits.
+    """
+    router_name = arguments.get("router_name", "")
+    commit_comment = arguments.get(
+        "commit_comment", "Confirming commit confirmed via MCP"
+    )
+    timeout = get_timeout_with_fallback(arguments.get("timeout"))
+
+    if router_name not in devices:
+        result = f"Router {router_name} not found in the device mapping."
+    else:
+
+        def _confirm_sync() -> str:
+            with connection_pool.get_connection(router_name, timeout) as junos_device:
+                config_util = Config(junos_device)
+                try:
+                    config_util.lock()
+                except Exception as e:
+                    return f"Failed to lock configuration: {e}"
+
+                try:
+                    pending = config_util.diff()
+                    if pending:
+                        config_util.unlock()
+                        return (
+                            f"Failed to confirm commit on {router_name}: the "
+                            "candidate configuration has uncommitted changes. "
+                            "Nothing was committed; review them first:\n"
+                            f"{pending}"
+                        )
+                    config_util.commit(comment=commit_comment, timeout=timeout)
+                    config_util.unlock()
+                    return (
+                        f"Commit confirmed on {router_name}. The automatic "
+                        "rollback is cancelled."
+                    )
+                except Exception as e:
+                    try:
+                        config_util.unlock()
+                    except Exception:
+                        # Same reasoning as _load_and_commit_sync: never hand
+                        # a possibly-locked session back to the pool.
+                        try:
+                            junos_device.close()
+                        except Exception:
+                            pass
+                    return f"Failed to confirm commit on {router_name}: {e}"
+
+        try:
+            result = await anyio.to_thread.run_sync(_confirm_sync)
+        except ValueError as ve:
+            result = f"Error: {ve}"
+        except ConnectError as ce:
+            result = f"Connection error to {router_name}: {ce}"
+        except Exception as e:
+            result = f"An error occurred: {e}"
+
+    return [
+        types.TextContent(
+            type="text",
+            text=result,
+            annotations={"router_name": router_name},
+        )
+    ]
 
 
 def _is_error_content(content_blocks: list[types.ContentBlock]) -> bool:
@@ -1781,6 +1947,7 @@ TOOL_HANDLERS = {
     "gather_device_facts": handle_gather_device_facts,
     "get_router_list": handle_get_router_list,
     "load_and_commit_config": handle_load_and_commit_config,
+    "confirm_commit": handle_confirm_commit,
     "execute_junos_pfe_command": handle_execute_pfe_command,
 }
 
@@ -2028,6 +2195,17 @@ def create_mcp_server() -> Server:
                             ),
                             "default": 360,
                         },
+                        "confirm_timeout_mins": {
+                            "type": "integer",
+                            "minimum": CONFIRM_TIMEOUT_MIN,
+                            "maximum": CONFIRM_TIMEOUT_MAX,
+                            "description": (
+                                "Commit with 'commit confirmed N': each device "
+                                "automatically rolls back after N minutes unless "
+                                "confirm_commit is called for it. Ignored when "
+                                "dry_run=true. Omit for a plain commit."
+                            ),
+                        },
                     },
                     "required": ["template_content", "vars_content"],
                 },
@@ -2058,7 +2236,14 @@ def create_mcp_server() -> Server:
             ),
             types.Tool(
                 name="load_and_commit_config",
-                description="Load and commit configuration on a Junos router",
+                description=(
+                    "Load and commit configuration on a Junos router. A commit "
+                    "check always runs first; if it fails, nothing is committed "
+                    "and the candidate is rolled back. Set dry_run=true to only "
+                    "run the check and show the diff. Set confirm_timeout_mins to "
+                    "use 'commit confirmed', then call confirm_commit before the "
+                    "timer expires or the device rolls back automatically."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -2080,8 +2265,65 @@ def create_mcp_server() -> Server:
                             "description": "Commit comment",
                             "default": "Configuration loaded via MCP",
                         },
+                        "dry_run": {
+                            "type": "boolean",
+                            "description": (
+                                "If true, load the configuration, run a commit "
+                                "check and return the diff, then roll back "
+                                "without committing."
+                            ),
+                            "default": False,
+                        },
+                        "confirm_timeout_mins": {
+                            "type": "integer",
+                            "minimum": CONFIRM_TIMEOUT_MIN,
+                            "maximum": CONFIRM_TIMEOUT_MAX,
+                            "description": (
+                                "Commit with 'commit confirmed N': the device "
+                                "automatically rolls back after N minutes unless "
+                                "confirm_commit is called. Omit for a plain commit."
+                            ),
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": (
+                                "Timeout in seconds for the connection and commit "
+                                "RPC. Falls back to the JUNOS_TIMEOUT environment "
+                                "variable, then 360."
+                            ),
+                            "default": 360,
+                        },
                     },
                     "required": ["router_name", "config_text"],
+                },
+            ),
+            types.Tool(
+                name="confirm_commit",
+                description=(
+                    "Confirm a pending 'commit confirmed' on a Junos router, "
+                    "cancelling its automatic rollback. Refuses if the candidate "
+                    "configuration has uncommitted changes, so it never commits "
+                    "anything new."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "router_name": {
+                            "type": "string",
+                            "description": "The name of the router",
+                        },
+                        "commit_comment": {
+                            "type": "string",
+                            "description": "Commit comment",
+                            "default": "Confirming commit confirmed via MCP",
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Timeout in seconds",
+                            "default": 360,
+                        },
+                    },
+                    "required": ["router_name"],
                 },
             ),
         ]
