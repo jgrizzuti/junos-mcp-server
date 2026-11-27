@@ -1180,6 +1180,31 @@ def _parse_confirm_timeout(value) -> int | None:
     return value
 
 
+def _parse_ignore_warnings(value) -> list[str] | None:
+    """Validate an optional ignore_warnings argument for load_and_commit_config.
+
+    Returns None when no warnings should be ignored, otherwise a list of
+    non-empty strings. PyEZ matches each one (case-insensitive regex search)
+    against the warning text of the load RPC, so only those warnings are
+    tolerated; errors and any other warning still fail the load. A blanket
+    ``True`` is deliberately not accepted.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or not value:
+        raise ValueError(
+            f"ignore_warnings must be a non-empty list of strings, got {value!r}"
+        )
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(
+                f"ignore_warnings entries must be non-empty strings, got {item!r}"
+            )
+    return list(value)
+
+
 def _confirmed_commit_note(router_name: str, confirm_timeout: int | None) -> str:
     """Reminder appended to a successful commit result when it must be confirmed."""
     if confirm_timeout is None:
@@ -1762,14 +1787,16 @@ async def handle_load_and_commit_config(
     dry_run = bool(arguments.get("dry_run", False))
     try:
         confirm_timeout = _parse_confirm_timeout(arguments.get("confirm_timeout_mins"))
-        confirm_error = None
+        ignore_warnings = _parse_ignore_warnings(arguments.get("ignore_warnings"))
+        arg_error = None
     except ValueError as ve:
         confirm_timeout = None
-        confirm_error = f"Error: {ve}"
+        ignore_warnings = None
+        arg_error = f"Error: {ve}"
 
     is_blocked, blocked_message = check_config_blocklist(config_text)
-    if confirm_error:
-        result = confirm_error
+    if arg_error:
+        result = arg_error
     elif is_blocked:
         result = blocked_message
     elif router_name not in devices:
@@ -1799,7 +1826,10 @@ async def handle_load_and_commit_config(
 
                     fmt = config_format.lower()
                     if fmt in ("set", "text", "xml"):
-                        config_util.load(config_text, format=fmt)
+                        load_kwargs = {"format": fmt}
+                        if ignore_warnings:
+                            load_kwargs["ignore_warning"] = ignore_warnings
+                        config_util.load(config_text, **load_kwargs)
                     else:
                         config_util.unlock()
                         return (
@@ -2382,6 +2412,19 @@ def create_mcp_server() -> Server:
                                 "automatically rolls back after N minutes unless "
                                 "confirm_commit is called. Ignored when "
                                 "dry_run=true. Omit for a plain commit."
+                            ),
+                        },
+                        "ignore_warnings": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1},
+                            "minItems": 1,
+                            "description": (
+                                "Warning texts to tolerate when loading, each "
+                                "matched as a case-insensitive regex against "
+                                "the Junos warning (e.g. 'block size is "
+                                "recommended'). Any other warning or any error "
+                                "still fails the load. Omit to fail on every "
+                                "warning."
                             ),
                         },
                         "timeout": {

@@ -299,6 +299,29 @@ class LoadAndCommitTests(_DeviceTestCase):
         self.cu.commit_check.return_value = False
         self.assertTrue(jmcp._is_error_content(self._call()))
 
+    def test_load_fails_on_warnings_by_default(self):
+        self._run()
+        self.assertNotIn("ignore_warning", self.cu.load.call_args.kwargs)
+
+    def test_ignore_warnings_passed_to_load(self):
+        pattern = "block size is recommended"
+        text = self._run(ignore_warnings=[pattern], dry_run=True)
+        self.assertIn("Dry run: commit check passed", text)
+        self.assertEqual(self.cu.load.call_args.kwargs["ignore_warning"], [pattern])
+
+    def test_ignore_warnings_single_string_is_accepted(self):
+        self._run(ignore_warnings="statement not found")
+        self.assertEqual(
+            self.cu.load.call_args.kwargs["ignore_warning"], ["statement not found"]
+        )
+
+    def test_invalid_ignore_warnings_never_touches_device(self):
+        for bad in (True, [], [""], ["ok", 3], {"a": 1}):
+            with self.subTest(bad=bad):
+                text = self._run(ignore_warnings=bad)
+                self.assertTrue(text.startswith("Error: ignore_warnings"))
+        self.mock_config_cls.assert_not_called()
+
     def test_refused_while_commit_confirmed_pending(self):
         self.set_commit_information(PENDING_WITH_COMMENT)
         for overrides in ({"dry_run": True}, {}, {"confirm_timeout_mins": 5}):

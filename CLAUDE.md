@@ -48,7 +48,7 @@ The server implements 10 MCP tools in `jmcp.py`:
 6. **render_and_apply_j2_template** - Render a Jinja2 template and load/commit it
 7. **gather_device_facts** - Collect device information using PyEZ facts
 8. **get_router_list** - List available routers from the configuration
-9. **load_and_commit_config** - Apply configuration changes (supports set/text/xml formats); always runs a commit check first, with optional `dry_run` and `confirm_timeout_mins` (commit confirmed)
+9. **load_and_commit_config** - Apply configuration changes (supports set/text/xml formats); always runs a commit check first, with optional `dry_run`, `confirm_timeout_mins` (commit confirmed) and `ignore_warnings` (tolerate only the listed Junos load warnings)
 10. **confirm_commit** - Confirm a pending commit confirmed so the device does not roll back
 
 Device inventory is defined solely by the JSON mapping file loaded and validated at startup. The former `add_device` and `reload_devices` runtime device-management tools were removed for security reasons (see `.commit-logs.txt`): they let any MCP client register attacker-controlled hosts, probe arbitrary IP:port pairs, and swap the device map from arbitrary server file paths.
